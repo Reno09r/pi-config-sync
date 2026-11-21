@@ -25,23 +25,50 @@ export interface Runtime { bundled: boolean; execPath: string; pathEnv?: string;
 type Level = "info" | "warning" | "error";
 type Ctx = ExtensionContext | ExtensionCommandContext;
 
+const COMMAND_HINTS: Array<{ value: string; label: string }> = [
+	{ value: "help", label: "help — Show all /gitsync commands and usage" },
+	{ value: "status", label: "status — Show repo, sync state, and default model" },
+	{ value: "sync", label: "sync — Commit local changes, preview/pull remote, and push" },
+	{ value: "pull", label: "pull — Fetch and preview remote changes before applying" },
+	{ value: "push", label: "push — Commit and push without pulling" },
+	{ value: "model", label: "model — Import/export default model (session <-> settings.json / remote)" },
+	{ value: "conflicts", label: "conflicts — Review or restore saved conflict backups" },
+	{ value: "init", label: "init [name|owner/name|url] — Create and connect first-machine repo" },
+	{ value: "link", label: "link [name|owner/name|url] — Connect another machine" },
+];
+
+function helpText() {
+	return [
+		"git-sync commands:",
+		...COMMAND_HINTS.map(c => `  /gitsync ${c.label}`),
+	].join("\n");
+}
+
 export default function gitSync(pi: ExtensionAPI) {
-	pi.registerCommand("gitsync", { description: "Securely sync pi config (init, link, status, sync, push, pull)", getArgumentCompletions: prefix => {
-		const entries = ["init", "link", "status", "sync", "push", "pull"].map(value => ({ value, label: value })).filter(x => x.value.startsWith(prefix.trim()));
+	pi.registerCommand("gitsync", { description: "Sync pi config (help, status, sync, pull, push, model, conflicts, init, link)", getArgumentCompletions: prefix => {
+		const entries = COMMAND_HINTS.filter(x => x.value.startsWith(prefix.trim().toLowerCase()));
 		return entries.length ? entries : null;
 	}, handler: async (args, ctx) => {
-		const [command = "status", ...rest] = args.trim().split(/\s+/); const arg = rest.join(" ");
+		const [rawCmd = "status", ...rest] = args.trim().split(/\s+/);
+		const command = rawCmd.toLowerCase();
+		const arg = rest.join(" ");
+		if (command === "help" || command === "?" || command === "--help" || command === "-h") {
+			notify(ctx, helpText(), "info");
+			return;
+		}
 		try { await withLock(ctx, async () => {
 			if (command === "init") return runInit(arg, ctx);
 			if (command === "link") return runLink(arg, ctx);
 			if (command === "status") return showStatus(ctx);
-			if (command === "sync") return runSync(ctx, { auto: false, push: true });
-			if (command === "push") return runSync(ctx, { auto: false, push: true, skipPull: true });
-			if (command === "pull") return runSync(ctx, { auto: false, push: false });
-			throw new Error("Unknown command. Usage: /gitsync [init|link|status|sync|push|pull]");
+			if (command === "model") return handleModelCommand(pi, ctx);
+			if (command === "conflicts") return handleConflictsCommand(ctx);
+			if (command === "sync") return runSync(ctx, { auto: false, push: true, pi });
+			if (command === "push") return runSync(ctx, { auto: false, push: true, skipPull: true, pi });
+			if (command === "pull") return runSync(ctx, { auto: false, push: false, pi });
+			notify(ctx, `Unknown command: "${command}".\n\n${helpText()}`, "warning");
 		}); } catch (error) { notify(ctx, `git-sync: ${message(error)}`, "error"); }
 	} });
-	pi.on("session_start", async (_event, ctx) => { if (await shouldAutoSync()) try { await withLock(ctx, async () => { await writeState({ lastAutoSyncAt: new Date().toISOString() }); await runSync(ctx, { auto: true, push: true }); }); } catch (error) { notify(ctx, `git-sync skipped: ${message(error)}`, "warning"); } });
+	pi.on("session_start", async (_event, ctx) => { if (await shouldAutoSync()) try { await withLock(ctx, async () => { await writeState({ lastAutoSyncAt: new Date().toISOString() }); await runSync(ctx, { auto: true, push: true, pi }); }); } catch (error) { notify(ctx, `git-sync skipped: ${message(error)}`, "warning"); } });
 	pi.on("session_shutdown", async (event, ctx) => { const reason = typeof event === "object" && event ? (event as { reason?: string }).reason : undefined; if (reason === "reload" || isSubagentChild() || !(await isSyncableRepo())) return; try { await withLock(ctx, async () => { await prepareCommit(undefined, ctx); await commitLocalChanges(undefined, undefined, ctx); await bestEffortPush(); }); } catch {} });
 }
 
@@ -207,7 +234,143 @@ async function assertSafeToPush(dir: string) {
 }
 async function push(first: boolean, dir: string) { await assertSafeToPush(dir); try { await git(first ? ["push", "-u", "origin", "HEAD"] : ["push"], dir, 15_000); return true; } catch { return false; } }
 async function bestEffortPush(deps?: Deps) { const dir = dirOf(deps); const upstream = await upstreamRef(dir); if (!upstream) return push(true, dir); const { ahead, behind } = await counts(upstream, dir); return ahead > 0 && behind === 0 ? push(false, dir) : false; }
-export async function runSync(ctx: Ctx | undefined, options: { auto: boolean; push: boolean; skipPull?: boolean }, deps?: Deps) { const dir = dirOf(deps); if (!(await isSyncableRepo(dir))) { if (!options.auto) notify(ctx, `git-sync: no git repo with an 'origin' remote in ${dir}. Run /gitsync init.`, "warning", deps); return; } if (ctx?.hasUI) ctx.ui.setStatus(STATUS_KEY, "syncing"); try { await prepareCommit(deps, ctx); const tracked = await trackedSecretFiles(dir); if (tracked.length) notify(ctx, `git-sync: tracked sensitive files: ${tracked.join(", ")}. Remove with git rm --cached <file>.`, "warning", deps); const changed: string[] = []; if (await commitLocalChanges(deps, undefined, ctx)) changed.push("committed local changes"); for (const line of gapMessages(await syncGaps(dir, await readConfig(deps, ctx)))) warnOnce(ctx, `git-sync: ${line}`, deps, `${dir}|${line}`); if (!options.skipPull) { if (!(await fetchOrigin(dir))) { if (!options.auto) notify(ctx, "git-sync: fetch failed; skipped pull/push.", "warning", deps); return; } const upstream = await upstreamRef(dir); if (upstream && (await counts(upstream, dir)).behind > 0) { const result = await integrate(upstream, dir); changed.push("pulled updates"); if (await normalizeSettings(deps, ctx)) changed.push("normalized settings.json"); if (result.resolved.length) notify(ctx, resolvedMessage(result), "warning", deps); } } if (options.push) { const upstream = await upstreamRef(dir); if (!upstream || (await counts(upstream, dir)).ahead > 0) { if (await push(!upstream, dir)) changed.push("pushed"); } } if (changed.some(x => x.startsWith("pulled"))) notify(ctx, `git-sync: ${changed.join(", ")}. Run /reload to apply pulled config.`, "info", deps); else if (!options.auto) notify(ctx, changed.length ? `git-sync: ${changed.join(", ")}.` : "git-sync: already up to date.", "info", deps); } finally { if (ctx?.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined); } }
+async function readJsonFile<T = Record<string, unknown>>(file: string): Promise<T | undefined> {
+	try { return JSON.parse(await fs.readFile(file, "utf8")) as T; } catch { return undefined; }
+}
+
+async function maybeApplyPulledModel(pi: ExtensionAPI | undefined, ctx: Ctx | undefined, dir: string, askIfDifferent = true) {
+	if (!pi || !ctx) return;
+	const settings = await readJsonFile<{ defaultProvider?: string; defaultModel?: string }>(path.join(dir, "settings.json"));
+	if (!settings?.defaultProvider || !settings?.defaultModel) return;
+	const cur = ctx.model;
+	if (cur && cur.provider === settings.defaultProvider && cur.id === settings.defaultModel) return;
+	const target = ctx.modelRegistry.find(settings.defaultProvider, settings.defaultModel);
+	if (!target) {
+		notify(ctx, `git-sync: default model ${settings.defaultProvider}/${settings.defaultModel} from settings.json was not found in model registry.`, "warning");
+		return;
+	}
+	if (askIfDifferent && ctx.hasUI) {
+		const curLabel = cur ? `${cur.provider}/${cur.id}` : "none";
+		const ok = await ctx.ui.confirm("Default model updated", `Current session: ${curLabel}\nNew in settings.json: ${target.provider}/${target.id}\n\nSwitch current session to this model?`);
+		if (!ok) return;
+	}
+	const switched = await pi.setModel(target);
+	notify(ctx, switched ? `git-sync: switched session model to ${target.provider}/${target.id}.` : `git-sync: failed to switch to ${target.provider}/${target.id} (check provider auth).`, switched ? "info" : "warning");
+}
+
+async function handleModelCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext) {
+	const dir = dirOf();
+	const settingsFile = path.join(dir, "settings.json");
+	const settings = (await readJsonFile<Record<string, unknown>>(settingsFile)) ?? {};
+	let remoteModel: { provider?: string; model?: string } = {};
+	if (await isSyncableRepo(dir)) {
+		await fetchOrigin(dir);
+		const upstream = await upstreamRef(dir);
+		if (upstream) {
+			try {
+				const raw = (await git(["show", `${upstream}:settings.json`], dir)).stdout;
+				const parsed = JSON.parse(raw) as { defaultProvider?: string; defaultModel?: string };
+				remoteModel = { provider: parsed.defaultProvider, model: parsed.defaultModel };
+			} catch {}
+		}
+	}
+	const sessionStr = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "none";
+	const localStr = settings.defaultProvider && settings.defaultModel ? `${settings.defaultProvider}/${settings.defaultModel}` : "not set";
+	const remoteStr = remoteModel.provider && remoteModel.model ? `${remoteModel.provider}/${remoteModel.model}` : "unavailable";
+	notify(ctx, `Session model: ${sessionStr}\nLocal settings.json: ${localStr}\nRemote (${remoteStr})`, "info");
+	if (!ctx.hasUI) return;
+
+	const choice = await ctx.ui.select("Default model sync", [
+		`Import remote default (${remoteStr}) -> session & settings.json`,
+		`Apply local settings.json (${localStr}) -> current session`,
+		`Save current session model (${sessionStr}) -> settings.json`,
+		"Cancel",
+	]);
+	if (!choice || choice === "Cancel") return;
+	if (choice.startsWith("Import remote default")) {
+		if (!remoteModel.provider || !remoteModel.model) {
+			notify(ctx, "git-sync: remote settings.json has no defaultProvider/defaultModel.", "warning");
+			return;
+		}
+		settings.defaultProvider = remoteModel.provider;
+		settings.defaultModel = remoteModel.model;
+		await fs.writeFile(settingsFile, JSON.stringify(settings, null, 2) + "\n");
+		await maybeApplyPulledModel(pi, ctx, dir, false);
+	} else if (choice.startsWith("Apply local")) {
+		await maybeApplyPulledModel(pi, ctx, dir, false);
+	} else if (choice.startsWith("Save current")) {
+		if (!ctx.model) { notify(ctx, "git-sync: no active model in current session.", "warning"); return; }
+		settings.defaultProvider = ctx.model.provider;
+		settings.defaultModel = ctx.model.id;
+		await fs.writeFile(settingsFile, JSON.stringify(settings, null, 2) + "\n");
+		notify(ctx, `git-sync: saved ${ctx.model.provider}/${ctx.model.id} as default in settings.json.`, "info");
+	}
+}
+
+async function handleConflictsCommand(ctx: ExtensionCommandContext) {
+	const dir = dirOf();
+	const conflictsRoot = path.join(stateDir(dir), "conflicts");
+	let folders: string[] = [];
+	try { folders = (await fs.readdir(conflictsRoot)).sort().reverse(); } catch {}
+	if (!folders.length) { notify(ctx, "git-sync: no saved conflict backups in .git-sync/conflicts/.", "info"); return; }
+	const latest = folders[0]!;
+	const latestDir = path.join(conflictsRoot, latest);
+	const files: string[] = [];
+	const walk = async (cur: string, rel = "") => {
+		for (const entry of await fs.readdir(cur, { withFileTypes: true })) {
+			const nextRel = rel ? `${rel}/${entry.name}` : entry.name;
+			if (entry.isDirectory()) await walk(path.join(cur, entry.name), nextRel);
+			else files.push(nextRel);
+		}
+	};
+	await walk(latestDir);
+	notify(ctx, `Latest conflict backup (${latest}):\n${files.map(f => `  - ${f}`).join("\n")}`, "info");
+	if (!ctx.hasUI || !files.length) return;
+	const action = await ctx.ui.select(`Conflict backup (${latest})`, [
+		"Restore a backed-up file",
+		"Clear all conflict backups",
+		"Close",
+	]);
+	if (action === "Clear all conflict backups") {
+		await fs.rm(conflictsRoot, { recursive: true, force: true });
+		notify(ctx, "git-sync: cleared .git-sync/conflicts/.", "info");
+	} else if (action === "Restore a backed-up file") {
+		const target = await ctx.ui.select("Select file to restore", files);
+		if (!target) return;
+		await fs.mkdir(path.dirname(path.join(dir, target)), { recursive: true });
+		await fs.copyFile(path.join(latestDir, target), path.join(dir, target));
+		notify(ctx, `git-sync: restored ${target} from backup. Run /reload if needed.`, "info");
+	}
+}
+
+async function previewRemotePull(ctx: Ctx, upstream: string, dir: string): Promise<boolean> {
+	const { stdout: statOut } = await git(["diff", "--stat", `HEAD..${upstream}`], dir);
+	let modelNote = "";
+	try {
+		const remoteSettings = JSON.parse((await git(["show", `${upstream}:settings.json`], dir)).stdout) as { defaultProvider?: string; defaultModel?: string };
+		const localSettings = await readJsonFile<{ defaultProvider?: string; defaultModel?: string }>(path.join(dir, "settings.json"));
+		if (remoteSettings.defaultProvider && remoteSettings.defaultModel && (remoteSettings.defaultProvider !== localSettings?.defaultProvider || remoteSettings.defaultModel !== localSettings?.defaultModel)) {
+			modelNote = `\nDefault model change: ${localSettings?.defaultProvider ?? "?"}/${localSettings?.defaultModel ?? "?"} -> ${remoteSettings.defaultProvider}/${remoteSettings.defaultModel}`;
+		}
+	} catch {}
+	while (true) {
+		notify(ctx, `Remote updates available (${upstream}):\n${statOut.trim()}${modelNote}`, "info");
+		const choice = await ctx.ui.select("Remote config updates available", [
+			"Apply changes (pull)",
+			"Show diff",
+			"Keep local (skip)",
+		]);
+		if (!choice || choice === "Keep local (skip)") return false;
+		if (choice === "Show diff") {
+			const diffText = (await git(["diff", `HEAD..${upstream}`], dir)).stdout.split("\n").slice(0, 50).join("\n");
+			notify(ctx, diffText || "(empty diff)", "info");
+			continue;
+		}
+		return true;
+	}
+}
+
+export async function runSync(ctx: Ctx | undefined, options: { auto: boolean; push: boolean; skipPull?: boolean; pi?: ExtensionAPI }, deps?: Deps) { const dir = dirOf(deps); if (!(await isSyncableRepo(dir))) { if (!options.auto) notify(ctx, `git-sync: no git repo with an 'origin' remote in ${dir}. Run /gitsync init.`, "warning", deps); return; } if (ctx?.hasUI) ctx.ui.setStatus(STATUS_KEY, "syncing"); try { await prepareCommit(deps, ctx); const tracked = await trackedSecretFiles(dir); if (tracked.length) notify(ctx, `git-sync: tracked sensitive files: ${tracked.join(", ")}. Remove with git rm --cached <file>.`, "warning", deps); const changed: string[] = []; if (await commitLocalChanges(deps, undefined, ctx)) changed.push("committed local changes"); for (const line of gapMessages(await syncGaps(dir, await readConfig(deps, ctx)))) warnOnce(ctx, `git-sync: ${line}`, deps, `${dir}|${line}`); let skippedPull = false; if (!options.skipPull) { if (!(await fetchOrigin(dir))) { if (!options.auto) notify(ctx, "git-sync: fetch failed; skipped pull/push.", "warning", deps); return; } const upstream = await upstreamRef(dir); if (upstream && (await counts(upstream, dir)).behind > 0) { const interactive = Boolean(ctx?.hasUI && !deps?.notify); const proceed = interactive ? await previewRemotePull(ctx!, upstream, dir) : true; if (!proceed) { skippedPull = true; changed.push("skipped remote pull"); } else { const result = await integrate(upstream, dir); changed.push("pulled updates"); if (await normalizeSettings(deps, ctx)) changed.push("normalized settings.json"); if (result.resolved.length) notify(ctx, resolvedMessage(result) + " Run /gitsync conflicts to inspect or restore.", "warning", deps); if (interactive) await maybeApplyPulledModel(options.pi, ctx, dir, true); } } } if (options.push && !skippedPull) { const upstream = await upstreamRef(dir); if (!upstream || (await counts(upstream, dir)).ahead > 0) { if (await push(!upstream, dir)) changed.push("pushed"); } } if (changed.some(x => x.startsWith("pulled"))) notify(ctx, `git-sync: ${changed.join(", ")}. Run /reload to apply pulled config.`, "info", deps); else if (!options.auto) notify(ctx, changed.length ? `git-sync: ${changed.join(", ")}.` : "git-sync: already up to date.", "info", deps); } finally { if (ctx?.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined); } }
 
 export function parseRepoReference(input: string, fallbackOwner: string) { const raw = input.trim().replace(/\.git$/i, ""); if (!raw) return undefined; const ssh = raw.match(/^git@github\.com:([^/\s]+)\/([^/\s]+)$/i); if (ssh) return { owner: ssh[1]!, name: ssh[2]! }; try { const url = new URL(raw); if (["github.com", "www.github.com"].includes(url.hostname) && url.pathname.split("/").filter(Boolean).length === 2) { const [owner, name] = url.pathname.split("/").filter(Boolean); return { owner: owner!, name: name!.replace(/\.git$/i, "") }; } } catch {} const bits = raw.split("/").filter(Boolean); if (bits.length === 1) return { owner: fallbackOwner, name: bits[0]! }; if (bits.length === 2 && !raw.includes(":")) return { owner: bits[0]!, name: bits[1]! }; return undefined; }
 function remoteFromArg(arg: string, fallback: string) { if (/^(https?|ssh):\/\//.test(arg) || /^git@/.test(arg) || arg.startsWith("/") || arg.startsWith(".")) return arg; const ref = parseRepoReference(arg, fallback); return ref ? `https://github.com/${ref.owner}/${ref.name}.git` : undefined; }
