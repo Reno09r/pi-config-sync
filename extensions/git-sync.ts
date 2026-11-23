@@ -265,21 +265,31 @@ async function handleDiffCommand(ctx: ExtensionCommandContext) {
 	const dir = dirOf();
 	if (!(await isSyncableRepo(dir))) { notify(ctx, "git-sync: no git repo in ~/.pi/agent. Run /gitsync init.", "warning"); return; }
 	const sections: string[] = [];
-	const localStat = (await git(["diff", "--stat"], dir)).stdout.trim();
-	const localDiff = (await git(["diff"], dir)).stdout.trim();
-	if (localStat || localDiff) {
-		sections.push(`Local changes:\n${localStat}\n${localDiff.split("\n").slice(0, 50).join("\n")}`);
+	const statusOut = (await git(["status", "--short"], dir)).stdout.trim();
+	const localStat = (await git(["diff", "--stat", "HEAD"], dir)).stdout.trim();
+	const localDiff = (await git(["diff", "HEAD"], dir)).stdout.trim();
+	if (statusOut || localStat || localDiff) {
+		const lines = localDiff ? localDiff.split("\n") : [];
+		const preview = lines.slice(0, 40).join("\n") + (lines.length > 40 ? `\n... (${lines.length - 40} more lines)` : "");
+		sections.push(["Local changes:", statusOut, localStat, preview].filter(Boolean).join("\n"));
 	}
+	await fetchOrigin(dir);
 	const upstream = await upstreamRef(dir);
 	if (upstream) {
-		const { behind } = await counts(upstream, dir);
+		const { ahead, behind } = await counts(upstream, dir);
+		if (ahead > 0) {
+			const outStat = (await git(["diff", "--stat", `${upstream}..HEAD`], dir)).stdout.trim();
+			sections.push(`Outgoing to ${upstream} (${ahead} commits):\n${outStat}`);
+		}
 		if (behind > 0) {
 			const remStat = (await git(["diff", "--stat", `HEAD..${upstream}`], dir)).stdout.trim();
 			const remDiff = (await git(["diff", `HEAD..${upstream}`], dir)).stdout.trim();
-			sections.push(`Incoming from ${upstream} (${behind} commits):\n${remStat}\n${remDiff.split("\n").slice(0, 50).join("\n")}`);
+			const lines = remDiff ? remDiff.split("\n") : [];
+			const preview = lines.slice(0, 40).join("\n") + (lines.length > 40 ? `\n... (${lines.length - 40} more lines)` : "");
+			sections.push(`Incoming from ${upstream} (${behind} commits):\n${remStat}\n${preview}`);
 		}
 	}
-	notify(ctx, sections.length ? sections.join("\n\n") : "git-sync: no local or pending remote diff.", "info");
+	notify(ctx, sections.length ? sections.join("\n\n") : "git-sync: working tree is clean and up to date with origin.", "info");
 }
 
 async function handleLogCommand(ctx: ExtensionCommandContext) {
