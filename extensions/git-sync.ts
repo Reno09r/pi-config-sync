@@ -31,6 +31,9 @@ const COMMAND_HINTS: Array<{ value: string; label: string }> = [
 	{ value: "sync", label: "sync — Commit local changes, preview/pull remote, and push" },
 	{ value: "pull", label: "pull — Fetch and preview remote changes before applying" },
 	{ value: "push", label: "push — Commit and push without pulling" },
+	{ value: "diff", label: "diff — Show local and pending remote changes" },
+	{ value: "log", label: "log — Show recent config commits" },
+	{ value: "allow", label: "allow <path> — Add a safe path (e.g. mcp.json, pi-subagents) to extraPaths" },
 	{ value: "model", label: "model — Import/export default model (session <-> settings.json / remote)" },
 	{ value: "conflicts", label: "conflicts — Review or restore saved conflict backups" },
 	{ value: "init", label: "init [name|owner/name|url] — Create and connect first-machine repo" },
@@ -45,7 +48,7 @@ function helpText() {
 }
 
 export default function gitSync(pi: ExtensionAPI) {
-	pi.registerCommand("gitsync", { description: "Sync pi config (help, status, sync, pull, push, model, conflicts, init, link)", getArgumentCompletions: prefix => {
+	pi.registerCommand("gitsync", { description: "Sync pi config (help, status, sync, pull, push, diff, log, allow, model, conflicts, init, link)", getArgumentCompletions: prefix => {
 		const entries = COMMAND_HINTS.filter(x => x.value.startsWith(prefix.trim().toLowerCase()));
 		return entries.length ? entries : null;
 	}, handler: async (args, ctx) => {
@@ -60,6 +63,9 @@ export default function gitSync(pi: ExtensionAPI) {
 			if (command === "init") return runInit(arg, ctx);
 			if (command === "link") return runLink(arg, ctx);
 			if (command === "status") return showStatus(ctx);
+			if (command === "diff") return handleDiffCommand(ctx);
+			if (command === "log") return handleLogCommand(ctx);
+			if (command === "allow") return handleAllowCommand(arg, ctx);
 			if (command === "model") return handleModelCommand(pi, ctx);
 			if (command === "conflicts") return handleConflictsCommand(ctx);
 			if (command === "sync") return runSync(ctx, { auto: false, push: true, pi });
@@ -68,7 +74,10 @@ export default function gitSync(pi: ExtensionAPI) {
 			notify(ctx, `Unknown command: "${command}".\n\n${helpText()}`, "warning");
 		}); } catch (error) { notify(ctx, `git-sync: ${message(error)}`, "error"); }
 	} });
-	pi.on("session_start", async (_event, ctx) => { if (await shouldAutoSync()) try { await withLock(ctx, async () => { await writeState({ lastAutoSyncAt: new Date().toISOString() }); await runSync(ctx, { auto: true, push: true, pi }); }); } catch (error) { notify(ctx, `git-sync skipped: ${message(error)}`, "warning"); } });
+	pi.on("session_start", async (_event, ctx) => {
+		await updateSyncBadge(ctx);
+		if (await shouldAutoSync()) try { await withLock(ctx, async () => { await writeState({ lastAutoSyncAt: new Date().toISOString() }); await runSync(ctx, { auto: true, push: true, pi }); }); } catch (error) { notify(ctx, `git-sync skipped: ${message(error)}`, "warning"); }
+	});
 	pi.on("session_shutdown", async (event, ctx) => { const reason = typeof event === "object" && event ? (event as { reason?: string }).reason : undefined; if (reason === "reload" || isSubagentChild() || !(await isSyncableRepo())) return; try { await withLock(ctx, async () => { await prepareCommit(undefined, ctx); await commitLocalChanges(undefined, undefined, ctx); await bestEffortPush(); }); } catch {} });
 }
 
@@ -234,6 +243,76 @@ async function assertSafeToPush(dir: string) {
 }
 async function push(first: boolean, dir: string) { await assertSafeToPush(dir); try { await git(first ? ["push", "-u", "origin", "HEAD"] : ["push"], dir, 15_000); return true; } catch { return false; } }
 async function bestEffortPush(deps?: Deps) { const dir = dirOf(deps); const upstream = await upstreamRef(dir); if (!upstream) return push(true, dir); const { ahead, behind } = await counts(upstream, dir); return ahead > 0 && behind === 0 ? push(false, dir) : false; }
+async function updateSyncBadge(ctx: Ctx | undefined, deps?: Deps) {
+	if (!ctx?.hasUI || deps?.notify) return;
+	const dir = dirOf(deps);
+	if (!(await isSyncableRepo(dir))) return;
+	try {
+		const parts: string[] = [];
+		const dirty = (await git(["status", "--porcelain"], dir)).stdout.trim().split("\n").filter(Boolean).length;
+		if (dirty > 0) parts.push(`*${dirty}`);
+		const upstream = await upstreamRef(dir);
+		if (upstream) {
+			const { ahead, behind } = await counts(upstream, dir);
+			if (ahead > 0) parts.push(`↑${ahead}`);
+			if (behind > 0) parts.push(`↓${behind}`);
+		}
+		ctx.ui.setStatus(STATUS_KEY, parts.length ? `sync: ${parts.join(" ")}` : undefined);
+	} catch {}
+}
+
+async function handleDiffCommand(ctx: ExtensionCommandContext) {
+	const dir = dirOf();
+	if (!(await isSyncableRepo(dir))) { notify(ctx, "git-sync: no git repo in ~/.pi/agent. Run /gitsync init.", "warning"); return; }
+	const sections: string[] = [];
+	const localStat = (await git(["diff", "--stat"], dir)).stdout.trim();
+	const localDiff = (await git(["diff"], dir)).stdout.trim();
+	if (localStat || localDiff) {
+		sections.push(`Local changes:\n${localStat}\n${localDiff.split("\n").slice(0, 50).join("\n")}`);
+	}
+	const upstream = await upstreamRef(dir);
+	if (upstream) {
+		const { behind } = await counts(upstream, dir);
+		if (behind > 0) {
+			const remStat = (await git(["diff", "--stat", `HEAD..${upstream}`], dir)).stdout.trim();
+			const remDiff = (await git(["diff", `HEAD..${upstream}`], dir)).stdout.trim();
+			sections.push(`Incoming from ${upstream} (${behind} commits):\n${remStat}\n${remDiff.split("\n").slice(0, 50).join("\n")}`);
+		}
+	}
+	notify(ctx, sections.length ? sections.join("\n\n") : "git-sync: no local or pending remote diff.", "info");
+}
+
+async function handleLogCommand(ctx: ExtensionCommandContext) {
+	const dir = dirOf();
+	if (!(await isSyncableRepo(dir))) { notify(ctx, "git-sync: no git repo in ~/.pi/agent.", "warning"); return; }
+	const out = (await git(["log", "-n", "8", "--oneline", "--decorate"], dir)).stdout.trim();
+	notify(ctx, out || "git-sync: no commits yet.", "info");
+}
+
+async function handleAllowCommand(arg: string, ctx: ExtensionCommandContext) {
+	const dir = dirOf();
+	const cfgPath = path.join(dir, "git-sync.jsonc");
+	const cfg = await readConfig(undefined, ctx);
+	const current = cfg.extraPaths ?? [];
+	const target = arg.trim().replace(/\/+$/, "");
+	if (!target) {
+		notify(ctx, `Current extraPaths: ${current.length ? current.join(", ") : "(none)"}\nUsage: /gitsync allow <path>  (e.g. mcp.json, pi-subagents, models.json)`, "info");
+		return;
+	}
+	if (!validExtra(target)) {
+		notify(ctx, `git-sync: "${target}" is not allowed (looks sensitive, absolute, or contains '..').`, "warning");
+		return;
+	}
+	if (current.includes(target)) {
+		notify(ctx, `git-sync: "${target}" is already in extraPaths.`, "info");
+		return;
+	}
+	const nextCfg: GitSyncConfig = { ...cfg, extraPaths: [...current, target] };
+	await fs.writeFile(cfgPath, JSON.stringify(nextCfg, null, 2) + "\n");
+	await ensureIgnoreRules(dir, nextCfg);
+	notify(ctx, `git-sync: added "${target}" to git-sync.jsonc extraPaths. Run /gitsync sync to push it.`, "info");
+}
+
 async function readJsonFile<T = Record<string, unknown>>(file: string): Promise<T | undefined> {
 	try { return JSON.parse(await fs.readFile(file, "utf8")) as T; } catch { return undefined; }
 }
@@ -370,7 +449,7 @@ async function previewRemotePull(ctx: Ctx, upstream: string, dir: string): Promi
 	}
 }
 
-export async function runSync(ctx: Ctx | undefined, options: { auto: boolean; push: boolean; skipPull?: boolean; pi?: ExtensionAPI }, deps?: Deps) { const dir = dirOf(deps); if (!(await isSyncableRepo(dir))) { if (!options.auto) notify(ctx, `git-sync: no git repo with an 'origin' remote in ${dir}. Run /gitsync init.`, "warning", deps); return; } if (ctx?.hasUI) ctx.ui.setStatus(STATUS_KEY, "syncing"); try { await prepareCommit(deps, ctx); const tracked = await trackedSecretFiles(dir); if (tracked.length) notify(ctx, `git-sync: tracked sensitive files: ${tracked.join(", ")}. Remove with git rm --cached <file>.`, "warning", deps); const changed: string[] = []; if (await commitLocalChanges(deps, undefined, ctx)) changed.push("committed local changes"); for (const line of gapMessages(await syncGaps(dir, await readConfig(deps, ctx)))) warnOnce(ctx, `git-sync: ${line}`, deps, `${dir}|${line}`); let skippedPull = false; if (!options.skipPull) { if (!(await fetchOrigin(dir))) { if (!options.auto) notify(ctx, "git-sync: fetch failed; skipped pull/push.", "warning", deps); return; } const upstream = await upstreamRef(dir); if (upstream && (await counts(upstream, dir)).behind > 0) { const interactive = Boolean(ctx?.hasUI && !deps?.notify); const proceed = interactive ? await previewRemotePull(ctx!, upstream, dir) : true; if (!proceed) { skippedPull = true; changed.push("skipped remote pull"); } else { const result = await integrate(upstream, dir); changed.push("pulled updates"); if (await normalizeSettings(deps, ctx)) changed.push("normalized settings.json"); if (result.resolved.length) notify(ctx, resolvedMessage(result) + " Run /gitsync conflicts to inspect or restore.", "warning", deps); if (interactive) await maybeApplyPulledModel(options.pi, ctx, dir, true); } } } if (options.push && !skippedPull) { const upstream = await upstreamRef(dir); if (!upstream || (await counts(upstream, dir)).ahead > 0) { if (await push(!upstream, dir)) changed.push("pushed"); } } if (changed.some(x => x.startsWith("pulled"))) notify(ctx, `git-sync: ${changed.join(", ")}. Run /reload to apply pulled config.`, "info", deps); else if (!options.auto) notify(ctx, changed.length ? `git-sync: ${changed.join(", ")}.` : "git-sync: already up to date.", "info", deps); } finally { if (ctx?.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined); } }
+export async function runSync(ctx: Ctx | undefined, options: { auto: boolean; push: boolean; skipPull?: boolean; pi?: ExtensionAPI }, deps?: Deps) { const dir = dirOf(deps); if (!(await isSyncableRepo(dir))) { if (!options.auto) notify(ctx, `git-sync: no git repo with an 'origin' remote in ${dir}. Run /gitsync init.`, "warning", deps); return; } if (ctx?.hasUI) ctx.ui.setStatus(STATUS_KEY, "syncing"); try { await prepareCommit(deps, ctx); const tracked = await trackedSecretFiles(dir); if (tracked.length) notify(ctx, `git-sync: tracked sensitive files: ${tracked.join(", ")}. Remove with git rm --cached <file>.`, "warning", deps); const changed: string[] = []; if (await commitLocalChanges(deps, undefined, ctx)) changed.push("committed local changes"); for (const line of gapMessages(await syncGaps(dir, await readConfig(deps, ctx)))) warnOnce(ctx, `git-sync: ${line}`, deps, `${dir}|${line}`); let skippedPull = false; if (!options.skipPull) { if (!(await fetchOrigin(dir))) { if (!options.auto) notify(ctx, "git-sync: fetch failed; skipped pull/push.", "warning", deps); return; } const upstream = await upstreamRef(dir); if (upstream && (await counts(upstream, dir)).behind > 0) { const interactive = Boolean(ctx?.hasUI && !deps?.notify); const proceed = interactive ? await previewRemotePull(ctx!, upstream, dir) : true; if (!proceed) { skippedPull = true; changed.push("skipped remote pull"); } else { const result = await integrate(upstream, dir); changed.push("pulled updates"); if (await normalizeSettings(deps, ctx)) changed.push("normalized settings.json"); if (result.resolved.length) notify(ctx, resolvedMessage(result) + " Run /gitsync conflicts to inspect or restore.", "warning", deps); if (interactive) await maybeApplyPulledModel(options.pi, ctx, dir, true); } } } if (options.push && !skippedPull) { const upstream = await upstreamRef(dir); if (!upstream || (await counts(upstream, dir)).ahead > 0) { if (await push(!upstream, dir)) changed.push("pushed"); } } if (changed.some(x => x.startsWith("pulled"))) notify(ctx, `git-sync: ${changed.join(", ")}. Run /reload to apply pulled config.`, "info", deps); else if (!options.auto) notify(ctx, changed.length ? `git-sync: ${changed.join(", ")}.` : "git-sync: already up to date.", "info", deps); } finally { await updateSyncBadge(ctx, deps); } }
 
 export function parseRepoReference(input: string, fallbackOwner: string) { const raw = input.trim().replace(/\.git$/i, ""); if (!raw) return undefined; const ssh = raw.match(/^git@github\.com:([^/\s]+)\/([^/\s]+)$/i); if (ssh) return { owner: ssh[1]!, name: ssh[2]! }; try { const url = new URL(raw); if (["github.com", "www.github.com"].includes(url.hostname) && url.pathname.split("/").filter(Boolean).length === 2) { const [owner, name] = url.pathname.split("/").filter(Boolean); return { owner: owner!, name: name!.replace(/\.git$/i, "") }; } } catch {} const bits = raw.split("/").filter(Boolean); if (bits.length === 1) return { owner: fallbackOwner, name: bits[0]! }; if (bits.length === 2 && !raw.includes(":")) return { owner: bits[0]!, name: bits[1]! }; return undefined; }
 function remoteFromArg(arg: string, fallback: string) { if (/^(https?|ssh):\/\//.test(arg) || /^git@/.test(arg) || arg.startsWith("/") || arg.startsWith(".")) return arg; const ref = parseRepoReference(arg, fallback); return ref ? `https://github.com/${ref.owner}/${ref.name}.git` : undefined; }
