@@ -265,9 +265,11 @@ async function handleDiffCommand(ctx: ExtensionCommandContext) {
 	const dir = dirOf();
 	if (!(await isSyncableRepo(dir))) { notify(ctx, "git-sync: no git repo in ~/.pi/agent. Run /gitsync init.", "warning"); return; }
 	const sections: string[] = [];
+	const committed = await hasCommits(dir);
 	const statusOut = (await git(["status", "--short"], dir)).stdout.trim();
-	const localStat = (await git(["diff", "--stat", "HEAD"], dir)).stdout.trim();
-	const localDiff = (await git(["diff", "HEAD"], dir)).stdout.trim();
+	const diffArgs = committed ? ["HEAD"] : [];
+	const localStat = (await git(["diff", "--stat", ...diffArgs], dir)).stdout.trim();
+	const localDiff = (await git(["diff", ...diffArgs], dir)).stdout.trim();
 	if (statusOut || localStat || localDiff) {
 		const lines = localDiff ? localDiff.split("\n") : [];
 		const preview = lines.slice(0, 40).join("\n") + (lines.length > 40 ? `\n... (${lines.length - 40} more lines)` : "");
@@ -275,7 +277,7 @@ async function handleDiffCommand(ctx: ExtensionCommandContext) {
 	}
 	await fetchOrigin(dir);
 	const upstream = await upstreamRef(dir);
-	if (upstream) {
+	if (upstream && committed) {
 		const { ahead, behind } = await counts(upstream, dir);
 		if (ahead > 0) {
 			const outStat = (await git(["diff", "--stat", `${upstream}..HEAD`], dir)).stdout.trim();
@@ -295,6 +297,7 @@ async function handleDiffCommand(ctx: ExtensionCommandContext) {
 async function handleLogCommand(ctx: ExtensionCommandContext) {
 	const dir = dirOf();
 	if (!(await isSyncableRepo(dir))) { notify(ctx, "git-sync: no git repo in ~/.pi/agent.", "warning"); return; }
+	if (!(await hasCommits(dir))) { notify(ctx, "git-sync: no commits yet.", "info"); return; }
 	const out = (await git(["log", "-n", "8", "--oneline", "--decorate"], dir)).stdout.trim();
 	notify(ctx, out || "git-sync: no commits yet.", "info");
 }
@@ -302,6 +305,15 @@ async function handleLogCommand(ctx: ExtensionCommandContext) {
 async function handleAllowCommand(arg: string, ctx: ExtensionCommandContext) {
 	const dir = dirOf();
 	const cfgPath = path.join(dir, "git-sync.jsonc");
+	try {
+		const raw = await fs.readFile(cfgPath, "utf8");
+		JSON.parse(stripJsonComments(raw));
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+			notify(ctx, "git-sync: git-sync.jsonc has invalid JSON; fix it before using /gitsync allow.", "error");
+			return;
+		}
+	}
 	const cfg = await readConfig(undefined, ctx);
 	const current = cfg.extraPaths ?? [];
 	const target = arg.trim().replace(/\/+$/, "");
@@ -451,7 +463,8 @@ async function previewRemotePull(ctx: Ctx, upstream: string, dir: string): Promi
 		]);
 		if (!choice || choice === "Keep local (skip)") return false;
 		if (choice === "Show diff") {
-			const diffText = (await git(["diff", `HEAD..${upstream}`], dir)).stdout.split("\n").slice(0, 50).join("\n");
+			const lines = (await git(["diff", `HEAD..${upstream}`], dir)).stdout.split("\n");
+			const diffText = lines.slice(0, 50).join("\n") + (lines.length > 50 ? `\n... (${lines.length - 50} more lines)` : "");
 			notify(ctx, diffText || "(empty diff)", "info");
 			continue;
 		}
